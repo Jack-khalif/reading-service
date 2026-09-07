@@ -31,16 +31,13 @@ def ingest_reading(reading: ReadingIn):
     is_anomaly = (recorded_at - now) > timedelta(seconds=CLOCK_SKEW_TOLERANCE_SECONDS)
 
     with get_conn(DB_PATH) as conn:
-        # NOTE: naive "check then insert". See tests/test_concurrency.py --
-        # this has a real race under concurrent duplicate submission.
-        existing = conn.execute(
-            "SELECT 1 FROM readings WHERE reading_id = ?", (reading.reading_id,)
-        ).fetchone()
-        if existing:
-            return JSONResponse(status_code=200, content={"status": "duplicate"})
-
+        # Atomic insert-or-ignore instead of "check then insert": the
+        # uniqueness decision is made by SQLite itself as part of a single
+        # statement, so there's no window between "check" and "act" for a
+        # second concurrent request to slip into. `changes()` tells us
+        # whether this call was the one that actually inserted the row.
         conn.execute(
-            """INSERT INTO readings
+            """INSERT OR IGNORE INTO readings
                (reading_id, device_id, metric, value, recorded_at, arrived_at, clock_anomaly)
                VALUES (?, ?, ?, ?, ?, ?, ?)""",
             (
@@ -53,7 +50,11 @@ def ingest_reading(reading: ReadingIn):
                 int(is_anomaly),
             ),
         )
-    return {"status": "created"}
+        inserted = conn.execute("SELECT changes()").fetchone()[0]
+
+    if inserted:
+        return {"status": "created"}
+    return JSONResponse(status_code=200, content={"status": "duplicate"})
 
 
 @app.get("/devices/{device_id}/metrics/{metric}/latest")
