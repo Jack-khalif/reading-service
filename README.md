@@ -102,9 +102,6 @@ dropping data.
 
 ## The flaky test
 
-This is the part of the exercise that's actually about engineering
-judgment, so here's the full story rather than just "look at the git log."
-
 **The scenario.** Devices on bad hospital Wi-Fi can retry a send if they
 don't get a timely response, so the same `reading_id` can arrive twice at
 almost the same instant — a genuine concurrent duplicate, not a
