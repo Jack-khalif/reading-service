@@ -33,7 +33,7 @@ CREATE TABLE IF NOT EXISTS readings (
     value           REAL NOT NULL,
     recorded_at     TEXT NOT NULL,
     arrived_at      TEXT NOT NULL,
-    clock_anomaly   INTEGER NOT NULL DEFAULT 0
+    
 );
 CREATE INDEX IF NOT EXISTS idx_device_metric_time
     ON readings (device_id, metric, recorded_at);
