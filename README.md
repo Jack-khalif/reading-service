@@ -143,9 +143,3 @@ concurrent requests after the fix: 0 failures.
 1. `Add concurrency test for duplicate submission -- intermittently failing`
 2. `Fix duplicate-ingestion race: atomic INSERT OR IGNORE instead of check-then-insert`
 
-The takeaway I'd defend on a call: the fix that actually matters here
-isn't "retry the request" or "add a sleep" — patches like that would make
-the test pass more often without touching the actual bug. The fix is
-collapsing two statements (a decision the *application* was making across
-a round trip) into one statement (a decision the *database* makes
-atomically), which removes the race instead of just making it rarer.
