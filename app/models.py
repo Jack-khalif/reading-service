@@ -1,6 +1,5 @@
 from pydantic import BaseModel, Field
 
-
 class ReadingIn(BaseModel):
     device_id: str
     reading_id: str
