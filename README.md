@@ -7,10 +7,32 @@ unreliable Wi-Fi, and answering:
 
 ## Running it
 
+You need a PostgreSQL server (16 is what CI uses). Either:
+
 ```bash
+docker compose up -d   # starts Postgres on :5432 with `readings` and `readings_test` databases
+```
+
+or install Postgres yourself (on a Mac, [Postgres.app](https://postgresapp.com)
+is the least-effort option) and create the two databases:
+
+```bash
+createdb -U postgres readings
+createdb -U postgres readings_test
+```
+
+Then:
+
+```bash
+python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
+alembic upgrade head          # create/upgrade the schema
 uvicorn app.main:app --reload
 ```
+
+The app reads `DATABASE_URL` (default
+`postgresql://postgres@localhost:5432/readings`). It does **not** create
+tables on startup — `alembic upgrade head` is a separate, explicit step.
 
 Then:
 
@@ -34,13 +56,48 @@ curl "localhost:8000/devices/PUMP-014/readings?start=2026-09-07T00:00:00Z&end=20
 python -m pytest -v
 ```
 
+Tests run against a separate database, `TEST_DATABASE_URL` (default
+`postgresql://postgres@localhost:5432/readings_test`), so they can never wipe
+your dev data. The test session builds the schema by running the Alembic
+migrations — the same path production takes — and each test starts from an
+empty `readings` table (`TRUNCATE`). CI does the same against a Postgres
+service container (`.github/workflows/ci.yml`).
+
 ## Design decisions
 
-**Storage.** SQLite, `reading_id` as the PRIMARY KEY. This isn't just "a
-database" — the primary key is what actually gives us idempotency. We don't
-maintain a separate "seen reading ids" set in application memory; SQLite's
-own constraint is the source of truth for "have we stored this reading
-already."
+**Storage.** PostgreSQL, `reading_id` as the PRIMARY KEY. This isn't just
+"a database" — the primary key is what actually gives us idempotency. We
+don't maintain a separate "seen reading ids" set in application memory;
+Postgres's own constraint is the source of truth for "have we stored this
+reading already."
+
+The service started on SQLite and was moved to Postgres because a real
+deployment has several app processes writing at once, and SQLite allows only
+one writer at a time per file. What changed in the move:
+
+| | SQLite (before) | PostgreSQL (now) |
+|---|---|---|
+| Idempotent insert | `INSERT OR IGNORE` + `SELECT changes()` | `INSERT ... ON CONFLICT (reading_id) DO NOTHING RETURNING reading_id` |
+| Timestamps | ISO-8601 **text** | `TIMESTAMPTZ` |
+| `clock_anomaly` | `INTEGER` 0/1 | `BOOLEAN` |
+| Connections | new connection per request | `psycopg_pool` pool of 10, one per in-flight request |
+| Schema | `CREATE TABLE IF NOT EXISTS` on startup | Alembic migrations |
+| Placeholders | `?` | `%s` (psycopg; values are still sent separately, never string-formatted into SQL) |
+
+`RETURNING` replaces `changes()`: it only produces a row if *this* statement
+inserted one, so "did I create it or was it a duplicate?" is answered by the
+same statement that made the decision.
+
+The timestamp change fixes a latent bug, not just a style point. As text,
+`"2026-09-07T12:00:00+03:00"` sorts *after* `"2026-09-07T09:15:00Z"`, even
+though 12:00 in UTC+3 is 09:00 UTC — 15 minutes *earlier*. Any device
+reporting a non-UTC offset could have had an older reading win "latest".
+`TIMESTAMPTZ` stores an absolute instant, so ordering and range filters
+compare moments, not characters
+(`test_latest_compares_instants_not_strings`). Responses still render
+timestamps as UTC with a `Z` suffix. A side benefit: `recorded_at`, `start`
+and `end` are now parsed as datetimes, so a malformed timestamp gets a 422
+instead of being compared as a string.
 
 **recorded_at vs arrived_at.** These are stored as separate columns and
 never conflated. Every "latest" or "range" query sorts and filters by
@@ -50,8 +107,8 @@ heard about it. `arrived_at` is kept because it's still useful operationally
 (e.g. to notice a device that's gone quiet), even though no endpoint here
 queries by it.
 
-**Idempotency (resent readings).** Ingest uses `INSERT OR IGNORE` on
-`reading_id`. If the row already exists, the insert is a no-op and the
+**Idempotency (resent readings).** Ingest uses
+`INSERT ... ON CONFLICT (reading_id) DO NOTHING`. If the row already exists, the insert is a no-op and the
 endpoint reports `{"status": "duplicate"}` with a 200. This has to be
 *atomic* — see "The flaky test" below for what went wrong with the first
 version of this.
@@ -95,10 +152,35 @@ dropping data.
 - **No pagination on the range-query endpoint.** For a real deployment with
   months of data per device this would matter; for the scope here (and the
   time box), I judged it not worth the complexity.
-- **No database migrations tooling** — schema is created directly via
-  `CREATE TABLE IF NOT EXISTS` on startup, which is fine for a single
-  SQLite file with one table, but is a corner I'd cut differently in a
-  service that expected to evolve its schema over time.
+
+## Schema migrations (Alembic)
+
+The schema lives in `migrations/versions/`, one file per change, each with an
+`upgrade()` and a `downgrade()`. Alembic records which revision a database is
+at in a small `alembic_version` table, so `alembic upgrade head` only applies
+what's missing — safe to run on every deploy.
+
+Why not `CREATE TABLE IF NOT EXISTS` any more? It only handles "table doesn't
+exist yet". It can't add a column to a table that already has a million
+rows, rename an index, or backfill data, and it leaves no record of what
+shape any given database is in. Migrations make each schema change a
+reviewed, versioned, reversible step that runs the same way on a laptop, in
+CI and in production.
+
+Day-to-day commands:
+
+```bash
+alembic upgrade head                 # apply all pending migrations
+alembic current                      # which revision is this database at?
+alembic history                      # list all revisions
+alembic revision -m "add unit column" # create a new, empty migration file to fill in
+alembic downgrade -1                 # undo the most recent migration
+```
+
+`migrations/env.py` reads the same `DATABASE_URL` as the app, so the two can
+never point at different databases. Migrations are written by hand rather
+than autogenerated, because the app uses plain SQL rather than SQLAlchemy
+models — there's no model metadata for Alembic to diff against.
 
 ## The flaky test
 
@@ -138,6 +220,30 @@ particular call was the one that inserted. Now there's only one statement
 making the uniqueness decision, so there's no window for a second request
 to slip into. Re-run 30 times at 2 concurrent requests and 15 times at 8
 concurrent requests after the fix: 0 failures.
+
+**After moving to PostgreSQL.** The fix became
+`INSERT ... ON CONFLICT (reading_id) DO NOTHING RETURNING reading_id`, and the
+test got much sharper. Each concurrent request now gets its own pooled
+connection — a genuinely separate database session — instead of SQLite
+serialising writers behind a file lock. Putting the old check-then-insert
+code back temporarily and re-running:
+
+| | naive check-then-insert | `ON CONFLICT DO NOTHING` |
+|---|---|---|
+| SQLite (before) | ~1 in 20 runs failed | 0 / 45 |
+| PostgreSQL, pool of 10 warm connections | **19 / 20 runs failed** | 0 / 30 |
+
+So the test went from "occasionally catches the bug" to "almost always
+catches it". The test also now asserts that exactly one of the 8 requests
+reports `created`.
+
+One surprise along the way: with the pool configured as `min_size=1`, the
+naive code passed **20 / 20** runs. Only one connection was open at the
+start, so the concurrent requests queued for it and ran one after another —
+the pool was accidentally serialising them and hiding the race. That's why
+the pool is fixed-size (`DB_POOL_SIZE`, default 10, all opened at startup).
+The lesson: a concurrency test only proves something if the concurrency
+actually reaches the database.
 
 **The two commits to look at:**
 1. `Add concurrency test for duplicate submission -- intermittently failing`

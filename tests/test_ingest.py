@@ -62,3 +62,17 @@ def test_time_range_query_returns_ordered_subset(client):
 def test_latest_returns_404_when_no_data(client):
     resp = client.get("/devices/UNKNOWN/metrics/battery_percent/latest")
     assert resp.status_code == 404
+
+
+def test_latest_compares_instants_not_strings(client):
+    """
+    12:00+03:00 is 09:00 UTC, i.e. EARLIER than 09:15Z -- even though
+    "12:00" > "09:15" as text. Timestamps must be compared as moments in
+    time (TIMESTAMPTZ), not as strings, or this device's offset would let
+    an older reading win "latest".
+    """
+    client.post("/readings", json=reading("utc", recorded_at="2026-09-07T09:15:00Z", value=35))
+    client.post("/readings", json=reading("eat", recorded_at="2026-09-07T12:00:00+03:00", value=38))
+
+    latest = client.get("/devices/PUMP-014/metrics/battery_percent/latest").json()
+    assert latest["reading_id"] == "utc"

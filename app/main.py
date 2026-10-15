@@ -1,56 +1,62 @@
-import os
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
 
-from app.db import get_conn, init_db, CLOCK_SKEW_TOLERANCE_SECONDS
+from app.db import CLOCK_SKEW_TOLERANCE_SECONDS, create_pool, get_database_url
 from app.models import ReadingIn
 
-DB_PATH = os.environ.get("READINGS_DB_PATH", "readings.db")
 
-app = FastAPI(title="Device Reading Service")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # The schema is NOT created here -- run `alembic upgrade head` first.
+    app.state.pool = create_pool(get_database_url())
+    app.state.pool.open(wait=True)
+    try:
+        yield
+    finally:
+        app.state.pool.close()
 
 
-@app.on_event("startup")
-def _startup():
-    init_db(DB_PATH)
+app = FastAPI(title="Device Reading Service", lifespan=lifespan)
 
 
-def _parse_iso(ts: str) -> datetime:
-    dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt
+def _iso(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _row_to_json(row: dict) -> dict:
+    return {**row, "recorded_at": _iso(row["recorded_at"]), "arrived_at": _iso(row["arrived_at"])}
 
 
 @app.post("/readings", status_code=201)
 def ingest_reading(reading: ReadingIn):
     now = datetime.now(timezone.utc)
-    recorded_at = _parse_iso(reading.recorded_at)
-    is_anomaly = (recorded_at - now) > timedelta(seconds=CLOCK_SKEW_TOLERANCE_SECONDS)
+    is_anomaly = (reading.recorded_at - now) > timedelta(seconds=CLOCK_SKEW_TOLERANCE_SECONDS)
 
-    with get_conn(DB_PATH) as conn:
+    with app.state.pool.connection() as conn:
         # Atomic insert-or-ignore instead of "check then insert": the
-        # uniqueness decision is made by SQLite itself as part of a single
+        # uniqueness decision is made by Postgres itself as part of a single
         # statement, so there's no window between "check" and "act" for a
-        # second concurrent request to slip into. `changes()` tells us
-        # whether this call was the one that actually inserted the row.
-        conn.execute(
-            """INSERT OR IGNORE INTO readings
+        # second concurrent request to slip into. RETURNING only produces a
+        # row if this call actually inserted one; on conflict it's empty.
+        inserted = conn.execute(
+            """INSERT INTO readings
                (reading_id, device_id, metric, value, recorded_at, arrived_at, clock_anomaly)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (%s, %s, %s, %s, %s, %s, %s)
+               ON CONFLICT (reading_id) DO NOTHING
+               RETURNING reading_id""",
             (
                 reading.reading_id,
                 reading.device_id,
                 reading.metric,
                 reading.value,
                 reading.recorded_at,
-                now.isoformat(),
-                int(is_anomaly),
+                now,
+                is_anomaly,
             ),
-        )
-        inserted = conn.execute("SELECT changes()").fetchone()[0]
+        ).fetchone()
 
     if inserted:
         return {"status": "created"}
@@ -59,10 +65,10 @@ def ingest_reading(reading: ReadingIn):
 
 @app.get("/devices/{device_id}/metrics/{metric}/latest")
 def latest_reading(device_id: str, metric: str):
-    with get_conn(DB_PATH) as conn:
+    with app.state.pool.connection() as conn:
         row = conn.execute(
             """SELECT * FROM readings
-               WHERE device_id = ? AND metric = ? AND clock_anomaly = 0
+               WHERE device_id = %s AND metric = %s AND NOT clock_anomaly
                ORDER BY recorded_at DESC LIMIT 1""",
             (device_id, metric),
         ).fetchone()
@@ -74,7 +80,7 @@ def latest_reading(device_id: str, metric: str):
             # say so explicitly.
             row = conn.execute(
                 """SELECT * FROM readings
-                   WHERE device_id = ? AND metric = ?
+                   WHERE device_id = %s AND metric = %s
                    ORDER BY recorded_at DESC LIMIT 1""",
                 (device_id, metric),
             ).fetchone()
@@ -83,8 +89,7 @@ def latest_reading(device_id: str, metric: str):
     if row is None:
         raise HTTPException(status_code=404, detail="No readings for this device/metric")
 
-    result = dict(row)
-    result["clock_anomaly"] = bool(result["clock_anomaly"])
+    result = _row_to_json(row)
     if anomaly_fallback:
         result["warning"] = "only clock-anomalous readings available"
     return result
@@ -93,20 +98,23 @@ def latest_reading(device_id: str, metric: str):
 @app.get("/devices/{device_id}/readings")
 def readings_in_range(
     device_id: str,
-    start: str = Query(..., description="ISO-8601 UTC start of range (inclusive)"),
-    end: str = Query(..., description="ISO-8601 UTC end of range (inclusive)"),
+    start: datetime = Query(..., description="ISO-8601 UTC start of range (inclusive)"),
+    end: datetime = Query(..., description="ISO-8601 UTC end of range (inclusive)"),
     metric: str | None = Query(None),
 ):
-    query = "SELECT * FROM readings WHERE device_id = ? AND recorded_at >= ? AND recorded_at <= ?"
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=timezone.utc)
+    if end.tzinfo is None:
+        end = end.replace(tzinfo=timezone.utc)
+
+    query = "SELECT * FROM readings WHERE device_id = %s AND recorded_at >= %s AND recorded_at <= %s"
     params = [device_id, start, end]
     if metric:
-        query += " AND metric = ?"
+        query += " AND metric = %s"
         params.append(metric)
     query += " ORDER BY recorded_at ASC"
 
-    with get_conn(DB_PATH) as conn:
+    with app.state.pool.connection() as conn:
         rows = conn.execute(query, params).fetchall()
 
-    return [
-        {**dict(r), "clock_anomaly": bool(r["clock_anomaly"])} for r in rows
-    ]
+    return [_row_to_json(r) for r in rows]

@@ -17,6 +17,11 @@ INSERT OR IGNORE, so SQLite itself makes the uniqueness decision inside
 one statement instead of the app making it across two. Verified stable
 across 30 repeated runs at low concurrency and 15 at high concurrency
 after the fix (see git history / README for numbers).
+
+Since moving to PostgreSQL the fix is INSERT ... ON CONFLICT (reading_id)
+DO NOTHING, and each request gets its own pooled connection, so this test
+now exercises genuinely parallel database sessions. Against the old
+check-then-insert code it fails 19 runs out of 20 instead of ~1 in 20.
 """
 import threading
 
@@ -38,6 +43,7 @@ def test_concurrent_duplicate_submission_is_handled_cleanly(client):
 
     statuses = sorted(resp.status_code for resp in results)
     assert all(s in (200, 201) for s in statuses), f"expected only 200/201, got {statuses}"
+    assert statuses.count(201) == 1, f"exactly one request should report 'created', got {statuses}"
 
     check = client.get(
         "/devices/PUMP-014/readings",

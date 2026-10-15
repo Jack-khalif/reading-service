@@ -1,40 +1,43 @@
 """
-SQLite storage layer for device readings.
+PostgreSQL storage layer for device readings.
+
+The schema itself lives in Alembic migrations (see `migrations/`), not here.
+This module only knows how to hand out connections.
 """
-import sqlite3
-from contextlib import contextmanager
-from pathlib import Path
+import os
+
+from psycopg.rows import dict_row
+from psycopg_pool import ConnectionPool
 
 CLOCK_SKEW_TOLERANCE_SECONDS = 120
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS readings (
-    reading_id      TEXT PRIMARY KEY,
-    device_id       TEXT NOT NULL,
-    metric          TEXT NOT NULL,
-    value           REAL NOT NULL,
-    recorded_at     TEXT NOT NULL,
-    arrived_at      TEXT NOT NULL,
-    clock_anomaly   INTEGER NOT NULL DEFAULT 0
-);
-CREATE INDEX IF NOT EXISTS idx_device_metric_time
-    ON readings (device_id, metric, recorded_at);
-"""
+DEFAULT_DATABASE_URL = "postgresql://postgres@localhost:5432/readings"
+
+POOL_SIZE = int(os.environ.get("DB_POOL_SIZE", "10"))
 
 
-def init_db(db_path: str) -> None:
-    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-    with get_conn(db_path) as conn:
-        conn.executescript(SCHEMA)
+def get_database_url() -> str:
+    return os.environ.get("DATABASE_URL", DEFAULT_DATABASE_URL)
 
 
-@contextmanager
-def get_conn(db_path: str):
-    conn = sqlite3.connect(db_path, timeout=5, check_same_thread=False)
-    conn.execute("PRAGMA busy_timeout = 5000")
-    conn.row_factory = sqlite3.Row
-    try:
-        yield conn
-        conn.commit()
-    finally:
-        conn.close()
+def create_pool(database_url: str) -> ConnectionPool:
+    # A pool keeps a handful of open connections and lends one to each
+    # request, instead of paying for a new TCP connection + Postgres backend
+    # process on every request. Concurrent requests get *different*
+    # connections, so the database -- not Python -- decides who wins when
+    # two of them insert the same reading_id.
+    #
+    # Fixed size (min == max) on purpose: with min_size=1, concurrent
+    # requests queue for the one warm connection while the pool slowly
+    # grows, which quietly serialises them -- and hid the check-then-insert
+    # race from tests/test_concurrency.py entirely (0/20 failures, vs 19/20
+    # with all connections open up front).
+    return ConnectionPool(
+        database_url,
+        min_size=POOL_SIZE,
+        max_size=POOL_SIZE,
+        # Every session runs in UTC, so TIMESTAMPTZ values come back as
+        # UTC datetimes regardless of the server's configured timezone.
+        kwargs={"row_factory": dict_row, "options": "-c timezone=UTC"},
+        open=False,
+    )
